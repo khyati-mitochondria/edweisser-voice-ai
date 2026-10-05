@@ -43,6 +43,18 @@ class VoiceCall:
         self.state = "LISTENING"
         self._tts_task: asyncio.Task | None = None
         self._last_language = "hi-IN"
+        # Bumped every time a response starts or is cancelled. A response only
+        # sends audio while the epoch it started with is still current, so a
+        # response that's been superseded or interrupted goes silent the
+        # instant the epoch moves -- even if its task hasn't finished
+        # unwinding yet. This is what stops an old reply's audio chunks from
+        # interleaving with the next reply's ("mumble-jumble").
+        self._epoch = 0
+        # Cleared while the user is mid-utterance (VAD speech_start ..
+        # speech_end/final). A reply that's ready to speak while the user is
+        # still talking waits on this instead of talking over them.
+        self._user_quiet = asyncio.Event()
+        self._user_quiet.set()
 
     async def run(self):
         try:
@@ -55,7 +67,8 @@ class VoiceCall:
         # If this session hasn't been greeted via the text path yet (e.g. the
         # user opened a voice call directly), speak the canned greeting now.
         if ensure_session_started(self.session_id):
-            self._tts_task = asyncio.create_task(self._speak_canned(GREETING_TEXT))
+            self._epoch += 1
+            self._tts_task = asyncio.create_task(self._speak_canned(GREETING_TEXT, self._epoch))
 
         relay_task = asyncio.create_task(self._relay_client_audio(), name="relay_client_audio")
         events_task = asyncio.create_task(self._consume_stt_events(), name="consume_stt_events")
@@ -111,14 +124,18 @@ class VoiceCall:
         async for event in self.stt.events():
             kind = event.get("event")
             if kind == "vad.speech_start":
+                self._user_quiet.clear()
                 if self.state == "SPEAKING":
                     logger.info("Barge-in: vad.speech_start while SPEAKING -- cutting off TTS. event=%s", event)
                     await self._barge_in()
                 else:
                     logger.debug("vad.speech_start while state=%s (no barge-in)", self.state)
+            elif kind == "vad.speech_end":
+                self._user_quiet.set()
             elif kind == "transcript.partial":
                 await self._send_json({"type": "user_partial", "text": event.get("text", "")})
             elif kind == "transcript.final":
+                self._user_quiet.set()
                 text = event.get("text", "")
                 # Sarvam's realtime STT reports the detected language (when
                 # language_code=auto) under the key "language", not
@@ -143,10 +160,41 @@ class VoiceCall:
     async def _handle_turn(self, user_text: str):
         if not user_text.strip():
             return
+        # Only ever one response in flight. Before, a new turn just started
+        # another task and overwrote the reference to the old one, so if the
+        # user spoke again while the previous reply was still being thought
+        # up or spoken, both ran at once and streamed audio into each other.
+        # Cancel the old one and wait for it to actually stop first; its
+        # unanswered user message stays in the session history, so the new
+        # reply naturally covers both things the user said.
+        await self._cancel_response()
+        self._epoch += 1
         self.state = "THINKING"
-        self._tts_task = asyncio.create_task(self._respond(user_text))
+        self._tts_task = asyncio.create_task(self._respond(user_text, self._epoch))
 
-    async def _respond(self, user_text: str):
+    async def _cancel_response(self):
+        # Bumping the epoch first mutes the old response synchronously (it
+        # checks the epoch before every audio chunk) -- cancellation itself
+        # only lands at the task's next await.
+        self._epoch += 1
+        task, self._tts_task = self._tts_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            # asyncio.wait, not `await task`: it waits for the task to finish
+            # unwinding (closing its TTS socket etc.) without re-raising the
+            # task's CancelledError into us.
+            await asyncio.wait({task})
+
+    async def _wait_for_user_quiet(self):
+        """Don't start talking over the user: if they're mid-utterance, hold
+        until VAD says they've stopped. Capped so a missed speech_end event
+        can never leave the bot silent forever."""
+        try:
+            await asyncio.wait_for(self._user_quiet.wait(), timeout=6.0)
+        except asyncio.TimeoutError:
+            self._user_quiet.set()
+
+    async def _respond(self, user_text: str, epoch: int):
         tts = SarvamTTSSession(language_code=self._last_language)
         tts_connected = False
         any_audio = False
@@ -174,13 +222,16 @@ class VoiceCall:
                 speech_text = to_speech_text(sentence)
                 if not speech_text.strip():
                     continue
+                await self._wait_for_user_quiet()
+                if epoch != self._epoch:
+                    return
                 if not tts_connected:
                     await tts.connect()
                     tts_connected = True
                 if playback_start is None:
                     playback_start = asyncio.get_event_loop().time()
                 self.state = "SPEAKING"
-                bytes_sent = await self._speak_sentence(tts, speech_text)
+                bytes_sent = await self._speak_sentence(tts, speech_text, epoch)
                 if bytes_sent:
                     any_audio = True
                     total_bytes_sent += bytes_sent
@@ -194,6 +245,10 @@ class VoiceCall:
             reply = await get_reply(self.session_id, user_text, on_sentence=on_sentence)
             await sentence_queue.put(None)
             await worker_task
+            if epoch != self._epoch:
+                # Interrupted/superseded while finishing -- a reply the user
+                # cut off shouldn't be reported as completed.
+                return
             # Streamed deltas are stripped and will get joined with plain
             # spaces client-side, losing paragraph breaks -- send the
             # properly-formatted canonical text too so the client can swap
@@ -231,10 +286,13 @@ class VoiceCall:
                     await worker_task
             if tts_connected:
                 await tts.close()
-            if self.state in ("SPEAKING", "THINKING"):
+            # Only reset state if this response is still the current one --
+            # a superseded response unwinding late must not flip the state
+            # out from under its replacement.
+            if epoch == self._epoch and self.state in ("SPEAKING", "THINKING"):
                 self.state = "LISTENING"
 
-    async def _speak_canned(self, text: str):
+    async def _speak_canned(self, text: str, epoch: int):
         """One-shot version of _respond for text that's already final (the
         greeting) -- no Claude call, just streams it through the same
         text-delta + TTS mechanics as a real reply."""
@@ -243,7 +301,7 @@ class VoiceCall:
         tts = SarvamTTSSession(language_code=self._last_language)
         try:
             await tts.connect()
-            bytes_sent = await self._speak_sentence(tts, text)
+            bytes_sent = await self._speak_sentence(tts, text, epoch)
             await self._send_json({"type": "assistant_done", "text": text, "demo_actions": []})
             if bytes_sent:
                 await asyncio.sleep(bytes_sent / (2 * 16000))
@@ -254,24 +312,34 @@ class VoiceCall:
             await self._safe_send_json({"type": "error", "message": f"voice playback failed: {exc}"})
         finally:
             await tts.close()
-            if self.state == "SPEAKING":
+            if epoch == self._epoch and self.state == "SPEAKING":
                 self.state = "LISTENING"
 
-    async def _speak_sentence(self, tts: SarvamTTSSession, sentence: str) -> int:
+    async def _speak_sentence(self, tts: SarvamTTSSession, sentence: str, epoch: int) -> int:
         """Sends one sentence through an already-connected TTS session and
-        forwards the resulting audio to the client. Returns bytes sent."""
+        forwards the resulting audio to the client. Returns bytes sent.
+        Stops sending the moment `epoch` is no longer current (the response
+        was interrupted or superseded)."""
         await tts.send_text(sentence)
         await tts.flush()
         bytes_sent = 0
         async for chunk in tts.audio_chunks():
+            if epoch != self._epoch:
+                break
             await self.client_ws.send_bytes(chunk)
             bytes_sent += len(chunk)
         return bytes_sent
 
     async def _barge_in(self):
+        # Order matters. Mute the old response first (synchronous epoch bump)
+        # so no further audio can be sent, THEN tell the client to drop what
+        # it has queued. Before, the interrupt went out first and the old
+        # task, still running during that await, could send more chunks
+        # after it -- the client had already cleared its queue, so those
+        # stale chunks played anyway.
+        self._epoch += 1
         await self._send_json({"type": "interrupt"})
-        if self._tts_task:
-            self._tts_task.cancel()
+        await self._cancel_response()
         self.state = "LISTENING"
 
     async def _send_json(self, payload: dict):

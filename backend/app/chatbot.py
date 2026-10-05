@@ -1,8 +1,8 @@
 from .config import LLM_PROVIDER
 from .llm_common import GREETING_TEXT, ChatReply
 
-if LLM_PROVIDER == "openrouter":
-    from .llm_openrouter import get_reply
+if LLM_PROVIDER in ("openai", "openrouter"):
+    from .llm_openai_compat import get_reply
 else:
     from .llm_anthropic import get_reply
 

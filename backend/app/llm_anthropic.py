@@ -62,7 +62,7 @@ async def get_reply(
             async with _client.messages.stream(
                 model=MODEL,
                 max_tokens=800,
-                system=build_system_prompt(),
+                system=build_system_prompt(user_text),
                 messages=history,
                 tools=TOOLS,
             ) as stream:

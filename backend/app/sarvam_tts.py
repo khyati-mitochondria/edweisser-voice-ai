@@ -5,7 +5,7 @@ import json
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from .config import SARVAM_API_KEY
+from .config import SARVAM_API_KEY, TTS_SPEAKER
 
 TTS_URL = "wss://api.sarvam.ai/text-to-speech/ws"
 
@@ -25,7 +25,7 @@ class SarvamTTSSession:
     PCM16 audio chunks -> audio_chunks().
     """
 
-    def __init__(self, language_code: str = "hi-IN", speaker: str = "ritu", model: str = "bulbul:v3"):
+    def __init__(self, language_code: str = "hi-IN", speaker: str = TTS_SPEAKER, model: str = "bulbul:v3"):
         self._language_code = language_code
         self._speaker = speaker
         self._model = model

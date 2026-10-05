@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 
 from openai import AsyncOpenAI
 
-from .config import OPENROUTER_API_KEY, OPENROUTER_MODEL
+from .config import LLM_PROVIDER, OPENAI_API_KEY, OPENAI_MODEL, OPENROUTER_API_KEY, OPENROUTER_MODEL
 from .llm_common import (
     ChatReply,
     SENTENCE_SPLIT_RE,
@@ -14,13 +14,23 @@ from .llm_common import (
     to_openai_tools,
 )
 
-logger = logging.getLogger("voice_ai.llm_openrouter")
+logger = logging.getLogger("voice_ai.llm_openai_compat")
 
-_client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-    default_headers={"X-Title": "Edweisser"},
-)
+# Both OpenAI itself and OpenRouter speak the OpenAI chat-completions protocol,
+# so one implementation serves either -- LLM_PROVIDER picks which.
+if LLM_PROVIDER == "openai":
+    _client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    MODEL = OPENAI_MODEL
+    # OpenAI's newer models reject the legacy `max_tokens` parameter.
+    _TOKEN_LIMIT = {"max_completion_tokens": 800}
+else:
+    _client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+        default_headers={"X-Title": "Edweisser"},
+    )
+    MODEL = OPENROUTER_MODEL
+    _TOKEN_LIMIT = {"max_tokens": 800}
 
 MAX_TOOL_ITERATIONS = 5
 TOOLS = to_openai_tools()
@@ -53,13 +63,13 @@ async def get_reply(
                 await on_sentence(sentence)
 
         for _ in range(MAX_TOOL_ITERATIONS):
-            messages_for_api = [{"role": "system", "content": build_system_prompt()}] + history
+            messages_for_api = [{"role": "system", "content": build_system_prompt(user_text)}] + history
             stream = await _client.chat.completions.create(
-                model=OPENROUTER_MODEL,
+                model=MODEL,
                 messages=messages_for_api,
                 tools=TOOLS,
-                max_tokens=800,
                 stream=True,
+                **_TOKEN_LIMIT,
             )
 
             content_parts: list[str] = []
@@ -106,9 +116,8 @@ async def get_reply(
                     }
                     for slot in tool_calls_acc.values()
                 ]
-            history.append(assistant_message)
-
             if finish_reason == "tool_calls" and tool_calls_acc:
+                tool_messages: list[dict] = []
                 for slot in tool_calls_acc.values():
                     try:
                         args = json.loads(slot["arguments"]) if slot["arguments"] else {}
@@ -118,11 +127,30 @@ async def get_reply(
                     result = await execute_client_tool(slot["name"], args)
                     if result.get("status") == "simulated":
                         demo_actions.append({"tool": slot["name"], "note": result.get("note", "")})
-                    history.append(
+                    tool_messages.append(
                         {"role": "tool", "tool_call_id": slot["id"], "content": json.dumps(result)}
                     )
+                # Models often say something before calling a tool ("I'll
+                # book that now"). Finish that sentence off here rather than
+                # letting it fuse with the first words after the tool
+                # result, and keep a paragraph break between the two halves
+                # of the reply text.
+                if buffer.strip():
+                    await emit(buffer)
+                buffer = ""
+                if raw_text_parts:
+                    raw_text_parts.append("\n\n")
+                # The assistant tool_calls message and its results go into
+                # history together, only once every tool has finished. This
+                # call can be cancelled mid-tool (the user barges in), and an
+                # assistant tool_calls message left in history without its
+                # matching tool results makes the provider reject every
+                # later request in the session with a 400.
+                history.append(assistant_message)
+                history.extend(tool_messages)
                 continue
 
+            history.append(assistant_message)
             break
 
         if buffer.strip():

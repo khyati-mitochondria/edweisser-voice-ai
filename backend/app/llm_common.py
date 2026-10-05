@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .config import COMPLAINT_NOTIFY_EMAIL
+from .config import COMPLAINT_NOTIFY_EMAIL, PERSONA_GENDER
 from .fund_catalog import DISCLAIMER, catalog_as_context
 from .tools.calendar_tool import book_meeting
 from .tools.email_tool import send_email
@@ -124,10 +124,156 @@ def get_lock(session_id: str) -> asyncio.Lock:
     return _session_locks.setdefault(session_id, asyncio.Lock())
 
 
-def build_system_prompt() -> str:
+_INDIC_REGISTER_BLOCK = """- When (and only when) the user is speaking a language other than English, talk
+  the way people actually TALK in that
+  language -- everyday spoken register, never the formal, literary or
+  Sanskritised/textbook register (that's how newsreaders and government notices
+  sound, not how a friendly person on a phone call sounds). Real speakers mix in
+  common English words, so you do too -- but ALWAYS written in that language's
+  own script ("कन्फ्यूज़िंग", "इंटरेस्ट", "फिक्स्ड डिपॉजिट", "बैंक"), never in
+  Latin letters, so the voice pronounces them like a native speaker. The only
+  things that stay in Latin letters are acronyms ("SIP", "NAV", "ETF", "FD") and
+  the exact names of Edelweiss funds/bundles.
+  For Hindi specifically: say "रिस्क", "रिटर्न", "फंड", "इन्वेस्टमेंट", "प्लान",
+  "गोल", "सेविंग्स", "अमाउंट", "मंथली", "टाइम", "आइडिया", "प्रॉब्लम" -- NOT
+  "जोखिम", "प्रतिफल", "योजना", "लक्ष्य", "राशि", "अवधि", "सुझाव", "सिफारिश",
+  "आदर्श", "बेहतरीन", "प्रभाव", "विचार करना" (say "सोचना"), "सामान्य". Use easy, everyday phrasing: "आप हर महीने कितना लगा सकते हैं?" not
+  "आप प्रतिमाह कितनी राशि का निवेश करना चाहेंगे?"; "देखिए", "चलिए", "बिल्कुल",
+  "ठीक है", "अच्छा", "हाँ जी" are natural. Keep sentences short and simple, and
+  stay polite and respectful ("आप", never "तुम"/"तू").
+  When addressing the USER in Hindi (or any language where the listener's gender
+  changes the verb), never guess their gender from their name or voice. Use the
+  neutral respectful plural: "आप कर सकते हैं", "आप सोच रहे हैं", "आप चाहेंगे" --
+  ALWAYS "-ते हैं / -एंगे", NEVER "सकती हैं / चाहती हैं / रही हैं" for the user,
+  unless the user's own words show they're a woman (e.g. they say "चाहती
+  हूँ"). This is separate from how you talk about YOURSELF, which is always
+  feminine ("मैं बता सकती हूँ").
+  Never spell out an acronym in full when speaking ("SIP", "NAV", "ETF" are
+  said as-is by everyone) -- only explain what it means if the user asks.
+  Apply the same principle to Marathi, Bengali, Tamil, Telugu, Kannada,
+  Malayalam, Gujarati, Punjabi and Odia: the casual spoken register that
+  people really use, with the common English loanwords in that script, not the
+  pure/formal written form. If the user themselves mixes English into their
+  sentences, mix the same way.
+"""
+
+
+# Distinctive Hindi words as typed in English letters. Deliberately excludes
+# words that are also common English ("main", "to", "hum", "par", "the", "me",
+# "hi", "do", "so") so plain English never trips it.
+_HINGLISH_WORDS = frozenset("""
+hai hain hoon ho hota hoti hote hoga hogi honge tha thi raha rahi rahe
+kya kaise kaisa kaisi kyun kyu kab kahan kaun kitna kitne kitni kuch koi
+mujhe mera meri mere tumhe tum aap aapka aapki aapke humein hamara hamari unka unki
+yeh ye woh wo yahan wahan abhi phir lekin magar aur bhi sirf bahut zyada jyada kam
+ke ki ka ko se mein liye wala wali wale
+karna karni karne karo kar karta karti karte kiya kiye
+chahiye chahta chahti chahte chahun
+sakta sakti sakte batao bataiye bataye batana samajh samjha samajhna
+dekho dekhiye bolo suno dena dede lena lele
+nahi nahin naa haan han theek thik accha acha bilkul zaroor zarur
+paisa paise rupaye rupay mahine saal
+dhanyavaad shukriya bhai
+""".split())
+
+_HINGLISH_TOKEN_RE = re.compile(r"[a-z]+")
+
+
+def detect_language_mode(user_text: str) -> str:
+    """"indic" (an Indian language in its own script), "hinglish" (Hindi typed
+    in English letters) or "english". Hinglish shares the Latin alphabet with
+    English so it can't be caught by script -- instead count distinctive Hindi
+    words: two or more, or one in a very short message ("nahi", "haan ok")."""
+    if _INDIC_SCRIPT_RE.search(user_text):
+        return "indic"
+    tokens = _HINGLISH_TOKEN_RE.findall(user_text.lower())
+    hits = {t for t in tokens if t in _HINGLISH_WORDS}
+    if len(hits) >= 2 or (len(hits) == 1 and len(tokens) <= 3):
+        return "hinglish"
+    return "english"
+
+
+_HINGLISH_BLOCK = """- The user is writing Hinglish (Hindi typed in English letters), so reply in
+  natural Hinglish the same way -- the way people text each other in India: Hindi
+  sentence structure written in English letters, with English words used as they
+  are. NEVER use Devanagari. Keep it casual and spoken, never formal/pure Hindi:
+  say "risk", "return", "fund", "investment", "plan", "goal", "amount", "monthly",
+  "time" -- NOT "jokhim", "pratifal", "yojana", "lakshya", "rashi", "avadhi",
+  "sujhav". Easy phrasing like "Aap har mahine kitna laga sakte hain?"; "dekhiye",
+  "chaliye", "bilkul", "theek hai", "accha", "haan ji" are natural. Short, simple
+  sentences; polite "aap", never "tum"/"tu".
+  When addressing the USER, never guess their gender: use "aap kar sakte hain",
+  "aap soch rahe hain" -- NEVER "sakti hain / chahti hain / rahi hain" for them,
+  unless their own words show they're a woman (e.g. "chahti hoon"). How you talk
+  about YOURSELF is separate and always follows your own gender (see above).
+  Acronyms ("SIP", "NAV", "ETF", "FD") are said as-is, never spelled out.
+"""
+
+
+# Any Indic script (Devanagari, Bengali, Gurmukhi, Gujarati, Odia, Tamil, Telugu,
+# Kannada, Malayalam). Voice transcripts and typed replies in these languages
+# arrive in their own script.
+_INDIC_SCRIPT_RE = re.compile(r"[\u0900-\u0DFF]")
+
+
+def build_system_prompt(user_text: str = "") -> str:
+    """`user_text` is the user's latest message. The detailed guidance for
+    speaking Hindi and other Indian languages is only included when it's in
+    one of those scripts: with it always present, the model's English replies
+    drifted into Hindi words (and Devanagari "रिस्क" showed up mid-sentence)."""
+    mode = detect_language_mode(user_text)
+    non_english = mode == "indic"
     now = datetime.now(IST)
     today_str = now.strftime("%A, %d %B %Y")
     now_str = now.strftime("%I:%M %p IST")
+
+    # Must match the TTS voice (config.TTS_SPEAKER): in Hindi and other
+    # gendered languages the model otherwise defaults to masculine forms for
+    # itself, which sounds wrong coming out of a female voice (and vice versa).
+    female = PERSONA_GENDER == "female"
+    self_forms = "FEMININE" if female else "MASCULINE"
+    persona_line = (
+        f"You are a {'woman' if female else 'man'}. In any language where a speaker's own "
+        "gender changes the grammar (Hindi, Marathi, Gujarati, Punjabi and others), ALWAYS "
+        f"refer to yourself with {self_forms} forms, consistently every single turn."
+    )
+    if non_english:
+        persona_line += (
+            " e.g. Hindi: " + ("\"मैं बताती हूँ\", \"मैं कर सकती हूँ\", \"मैं समझती हूँ\" -- never "
+                              "the masculine \"बताता हूँ\" / \"सकता हूँ\"."
+                              if female else
+                              "\"मैं बताता हूँ\", \"मैं कर सकता हूँ\", \"मैं समझता हूँ\" -- never "
+                              "the feminine \"बताती हूँ\" / \"सकती हूँ\".")
+        )
+
+    if mode == "hinglish":
+        persona_line += (
+            " e.g. in Hinglish: "
+            + ("\"main bata sakti hoon\", \"main samajhti hoon\" -- never \"bata sakta hoon\"."
+               if female else
+               "\"main bata sakta hoon\", \"main samajhta hoon\" -- never \"bata sakti hoon\".")
+        )
+
+    indic_block = {"indic": _INDIC_REGISTER_BLOCK, "hinglish": _HINGLISH_BLOCK}.get(mode, "")
+
+    # The language rule differs per mode. In English mode it must forbid any
+    # Hindi/Hinglish drift; in Hinglish mode that same sentence would
+    # contradict what the user is doing, and "own script" must not push the
+    # model into Devanagari.
+    if mode == "english":
+        lang_rule = (
+            "The language is decided ONLY by the user's latest message: it's in English, "
+            "so your ENTIRE reply is in English -- no Hindi words, no Hinglish, no "
+            "Devanagari -- regardless of earlier turns."
+        )
+    elif mode == "hinglish":
+        lang_rule = (
+            "The user's latest message is Hindi typed in English letters (Hinglish), so "
+            "reply in Hinglish in English letters -- this overrides \"own script\" above; "
+            "do NOT switch to Devanagari. The language is decided ONLY by their latest message."
+        )
+    else:
+        lang_rule = "The language is decided ONLY by the user's latest message."
 
     return f"""Your name is 'Edweisser'. You are an intelligent digital assistant for
 Edelweiss only, designed to engage customers in a friendly, personalised, SHORT, crisp
@@ -136,6 +282,7 @@ approach. Your key capabilities include text and voice-based responses and the
 ability to handle both product queries and complaints gracefully.
 
 **Instructions**
+- {persona_line}
 - You have already greeted the user and asked for their name at the start of this
   chat. Ask for their name politely if you don't have it yet, but do not mention it
   in every response, and assist them in exploring Edelweiss's financial products and
@@ -189,8 +336,8 @@ ability to handle both product queries and complaints gracefully.
   Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati, Punjabi, or Odia -- in that
   language's own script. On a voice call this matters every single turn: if the
   user switches language mid-conversation, switch with them immediately, don't
-  keep replying in the previous language.
-- Use the user's name only where it feels natural, not in every sentence.
+  keep replying in the previous language. {lang_rule}
+{indic_block}- Use the user's name only where it feels natural, not in every sentence.
 - RESPONSES SHOULD BE SHORT AND CRISP.
 
 **Tone**
