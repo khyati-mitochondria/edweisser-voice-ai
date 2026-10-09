@@ -33,7 +33,8 @@ class VoiceCall:
     text (this is a voice-only call), but it keeps the audio pacing natural
     and keeps barge-in timing accurate. A vad.speech_start event while
     SPEAKING is a barge-in: playback is interrupted client-side and the
-    in-flight response task is cancelled.
+    in-flight response task is cancelled. A client {"type": "interrupt"}
+    message (the UI's Stop button) does the same while THINKING or SPEAKING.
     """
 
     def __init__(self, session_id: str, client_ws: WebSocket):
@@ -117,6 +118,11 @@ class VoiceCall:
                     if data.get("type") == "stop":
                         logger.info("Client audio relay ending: client sent stop (session=%s)", self.session_id)
                         break
+                    if data.get("type") == "interrupt" and self.state in ("THINKING", "SPEAKING"):
+                        # The user hit "Stop" in the UI: same as a spoken
+                        # barge-in, minus the speech -- the call stays open.
+                        logger.info("Client interrupt while %s (session=%s)", self.state, self.session_id)
+                        await self._barge_in()
         except WebSocketDisconnect:
             logger.info("Client audio relay ending: WebSocketDisconnect (session=%s)", self.session_id)
 

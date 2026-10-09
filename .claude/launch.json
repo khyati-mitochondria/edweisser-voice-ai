@@ -11,6 +11,12 @@
         "5173"
       ],
       "port": 5173
+    },
+    {
+      "name": "backend",
+      "runtimeExecutable": "/Users/gscmac/Desktop/voice-ai/backend/.venv/bin/python",
+      "runtimeArgs": ["-m", "uvicorn", "--app-dir", "/Users/gscmac/Desktop/voice-ai/backend", "--env-file", "/Users/gscmac/Desktop/voice-ai/backend/.env", "app.main:app", "--port", "8000"],
+      "port": 8000
     }
   ]
 }

@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { PcmAudioPlayer } from '../audio/audio-player';
+import { readLevel } from '../audio/level';
 
 const BACKEND_WS_URL = import.meta.env.VITE_BACKEND_WS_URL || 'ws://localhost:8000';
 
@@ -16,11 +17,14 @@ const BACKEND_WS_URL = import.meta.env.VITE_BACKEND_WS_URL || 'ws://localhost:80
 // just making that visible.
 export function useVoiceCall({ sessionId, onStatusChange, onError, onTranscript }) {
   const [isCallActive, setIsCallActive] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
   const wsRef = useRef(null);
   const audioContextRef = useRef(null);
   const workletNodeRef = useRef(null);
   const micStreamRef = useRef(null);
   const playerRef = useRef(null);
+  const micAnalyserRef = useRef(null);
+  const micLevelBufferRef = useRef(new Float32Array(512));
   // Set right before we close the websocket ourselves, so the onclose
   // handler below can tell "the user ended the call" apart from "the
   // connection died out from under us" (Sarvam STT inactivity timeout, a
@@ -32,6 +36,7 @@ export function useVoiceCall({ sessionId, onStatusChange, onError, onTranscript 
     wsRef.current = null;
     workletNodeRef.current?.disconnect();
     workletNodeRef.current = null;
+    micAnalyserRef.current = null;
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
     micStreamRef.current = null;
     audioContextRef.current?.close();
@@ -39,6 +44,7 @@ export function useVoiceCall({ sessionId, onStatusChange, onError, onTranscript 
     playerRef.current?.close();
     playerRef.current = null;
     setIsCallActive(false);
+    setIsMuted(false);
   }, []);
 
   const startCall = useCallback(async () => {
@@ -117,6 +123,12 @@ export function useVoiceCall({ sessionId, onStatusChange, onError, onTranscript 
     };
 
     source.connect(workletNode);
+    // Taps the mic for the listening orb; not connected onward, so it adds
+    // nothing to what's played or sent.
+    const micAnalyser = audioContext.createAnalyser();
+    micAnalyser.fftSize = 512;
+    source.connect(micAnalyser);
+    micAnalyserRef.current = micAnalyser;
     // The worklet has no meaningful audio output, but some browsers only pump
     // process() while the node is connected somewhere in the graph.
     const silentGain = audioContext.createGain();
@@ -137,5 +149,40 @@ export function useVoiceCall({ sessionId, onStatusChange, onError, onTranscript 
     teardown();
   }, [teardown]);
 
-  return { isCallActive, startCall, endCall };
+  // The UI's "Stop" button: silence the agent right away (don't wait for the
+  // backend's round trip) and have the backend cancel the reply. The call
+  // stays open and goes straight back to listening.
+  const interrupt = useCallback(() => {
+    playerRef.current?.clear();
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'interrupt' }));
+    }
+    onStatusChange?.('listening');
+  }, [onStatusChange]);
+
+  // Muting the call just disables the mic track: the worklet keeps
+  // streaming (silent) frames so the backend's STT session stays alive, and
+  // the assistant's audio keeps playing.
+  const toggleMute = useCallback(() => {
+    setIsMuted((prev) => {
+      const next = !prev;
+      micStreamRef.current?.getAudioTracks().forEach((track) => {
+        track.enabled = !next;
+      });
+      return next;
+    });
+  }, []);
+
+  // Current loudness (0..1) of the customer's mic and of the agent's
+  // playback. Meant to be polled every animation frame, so it reads refs
+  // rather than state.
+  const getLevels = useCallback(
+    () => ({
+      user: readLevel(micAnalyserRef.current, micLevelBufferRef.current),
+      agent: playerRef.current?.level() ?? 0,
+    }),
+    [],
+  );
+
+  return { isCallActive, isMuted, startCall, endCall, toggleMute, interrupt, getLevels };
 }

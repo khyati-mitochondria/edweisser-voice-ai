@@ -1,3 +1,5 @@
+import { readLevel } from './level';
+
 // Schedules incoming PCM16 mono chunks back-to-back for gapless playback,
 // and can stop everything instantly on barge-in.
 export class PcmAudioPlayer {
@@ -6,6 +8,16 @@ export class PcmAudioPlayer {
     this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
     this.nextStartTime = 0;
     this.activeSources = [];
+    // Every chunk plays through this analyser so the UI can read how loud
+    // the agent currently is (see level()).
+    this.analyser = this.audioContext.createAnalyser();
+    this.analyser.fftSize = 512;
+    this.analyser.connect(this.audioContext.destination);
+    this.levelBuffer = new Float32Array(this.analyser.fftSize);
+  }
+
+  level() {
+    return readLevel(this.analyser, this.levelBuffer);
   }
 
   enqueue(arrayBuffer) {
@@ -20,7 +32,7 @@ export class PcmAudioPlayer {
 
     const source = this.audioContext.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(this.audioContext.destination);
+    source.connect(this.analyser);
 
     const now = this.audioContext.currentTime;
     const startAt = Math.max(now, this.nextStartTime);

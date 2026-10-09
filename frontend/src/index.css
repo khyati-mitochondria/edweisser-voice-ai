@@ -1,5 +1,5 @@
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
 }
 
 * {
@@ -8,4 +8,6 @@
 
 body {
   margin: 0;
+  background: #fff;
+  -webkit-font-smoothing: antialiased;
 }
